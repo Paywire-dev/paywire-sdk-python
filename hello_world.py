@@ -1,14 +1,14 @@
 """
-PayWire Hello World — Day 2 prototype (mock issuer).
+PayWire Hello World v2 — spend rule enforcement.
 
-Stripe Issuing requires a verified US business (Delaware C-Corp + compliance
-approval). We don't have that yet. For the prototype, we MOCK the issuer.
-The wiring — agent → Claude → tool call → issuer — is what matters.
+What's new vs v1:
+ - Agent now has TWO tools (issue + attempt_purchase), not just one.
+ - PayWire authorizes every purchase against the spend rules set at issuance.
+ - Three demo runs: in-budget approve, over-budget decline, wrong-merchant decline.
 
-Architecture upside: this is exactly the "provider-neutral" goal from the
-PayWire design doc (Section 2 / G5). The issuer is an abstracted function
-call. In Month 6, when we incorporate via Stripe Atlas, we swap the body of
-`issue_virtual_card` to call real Stripe Issuing or Lithic. 5-line change.
+This is PayWire G1 (programmatic spend governance) made concrete. The
+issuer creates a card with rules; the authorizer enforces them in real
+time before any transaction clears.
 
 Run:
     python hello_world.py
@@ -23,85 +23,193 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-anthropic_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 MODEL = "claude-sonnet-4-6"
 
-# --- Tool definition (what Claude is allowed to ask for) -----------------
+# In-memory "card database" — replaces real Stripe Issuing for now.
+ISSUED_CARDS: dict[str, dict] = {}
+
+
+# --- Tool definitions ------------------------------------------------------
 
 tools = [
     {
         "name": "issue_virtual_card",
         "description": (
-            "Issue a virtual payment card for a one-time purchase. "
-            "Returns a card token the agent can use to pay a merchant."
+            "Issue a virtual card with spend rules. Returns a card_id "
+            "that can be used in subsequent purchase attempts."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "amount_usd": {
                     "type": "number",
-                    "description": "Maximum spend allowed on this card, in USD.",
+                    "description": "Per-purchase cap, in USD.",
                 },
-                "merchant_description": {
-                    "type": "string",
-                    "description": "Brief description of what the agent is buying.",
+                "merchant_whitelist": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Allowed merchant domains. Use ['*'] to allow any.",
                 },
+                "purpose": {"type": "string"},
             },
-            "required": ["amount_usd", "merchant_description"],
+            "required": ["amount_usd", "purpose"],
         },
-    }
+    },
+    {
+        "name": "attempt_purchase",
+        "description": (
+            "Try to charge a card. PayWire authorizes in real time against "
+            "the spend rules set at issuance. Returns approved=true/false."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "card_id": {"type": "string"},
+                "amount_usd": {"type": "number"},
+                "merchant": {"type": "string"},
+            },
+            "required": ["card_id", "amount_usd", "merchant"],
+        },
+    },
 ]
 
 
-# --- The "PayWire" issuer function (MOCKED for now) -----------------------
+# --- The PayWire issuer + real-time authorizer ---------------------------
 
-def issue_virtual_card(amount_usd: float, merchant_description: str) -> dict:
-    """Mock issuer. Returns realistic-looking card data without hitting
-    Stripe.
-
-    Replace this body in Month 6 with real stripe.issuing.Card.create()
-    once PayWire is incorporated and has issuer access.
-    """
+def issue_virtual_card(amount_usd, purpose, merchant_whitelist=None):
+    card_id = f"ic_mock_{secrets.token_hex(6)}"
+    ISSUED_CARDS[card_id] = {
+        "per_purchase_cap_usd": amount_usd,
+        "merchant_whitelist": merchant_whitelist or ["*"],
+        "purpose": purpose,
+        "transactions": [],
+    }
     return {
-        "card_id": f"ic_mock_{secrets.token_hex(8)}",
-        "cardholder_id": f"ich_mock_{secrets.token_hex(8)}",
-        "card_token": f"tok_pw_{secrets.token_hex(12)}",
+        "card_id": card_id,
         "amount_usd_limit": amount_usd,
-        "purpose": merchant_description,
+        "allowed_merchants": merchant_whitelist or ["*"],
+        "purpose": purpose,
         "status": "active",
-        "brand": "Visa",
-        "last4": str(secrets.randbelow(10000)).zfill(4),
-        "_mock": True,  # so we never confuse this with a real card later
+        "_mock": True,
     }
 
 
-# --- Agent loop -----------------------------------------------------------
+def attempt_purchase(card_id, amount_usd, merchant):
+    """PayWire's real-time authorization hook. Every payment company wants
+    this layer; nobody offers it today as a clean primitive."""
+    card = ISSUED_CARDS.get(card_id)
+    if not card:
+        return {"approved": False, "reason": f"unknown card {card_id}"}
 
-def run_agent(user_request: str) -> None:
+    # Rule 1: per-purchase cap
+    if amount_usd > card["per_purchase_cap_usd"]:
+        return {
+            "approved": False,
+            "reason": (
+                f"amount ${amount_usd} exceeds per-purchase cap of "
+                f"${card['per_purchase_cap_usd']}"
+            ),
+        }
+
+    # Rule 2: merchant whitelist
+    allowed = card["merchant_whitelist"]
+    if "*" not in allowed and merchant not in allowed:
+        return {
+            "approved": False,
+            "reason": f"merchant '{merchant}' not in whitelist {allowed}",
+        }
+
+    # Approved — record the transaction.
+    txn = {
+        "merchant": merchant,
+        "amount_usd": amount_usd,
+        "txn_id": f"txn_{secrets.token_hex(4)}",
+    }
+    card["transactions"].append(txn)
+    return {
+        "approved": True,
+        "txn_id": txn["txn_id"],
+        "card_id": card_id,
+    }
+
+
+# --- Agent loop (multi-turn) ---------------------------------------------
+
+def run_agent(user_request, max_turns=6):
     print(f"\n🧑  User: {user_request}\n")
+    messages = [{"role": "user", "content": user_request}]
 
-    response = anthropic_client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        tools=tools,
-        messages=[{"role": "user", "content": user_request}],
-    )
+    for _ in range(max_turns):
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            tools=tools,
+            messages=messages,
+        )
 
-    for block in response.content:
-        if block.type == "text":
-            print(f"🤖  Claude: {block.text}\n")
-        elif block.type == "tool_use":
-            print(f"🛠  Claude called tool: {block.name}")
-            print(f"   with inputs: {json.dumps(block.input, indent=2)}\n")
+        text_blocks = [b.text for b in resp.content if b.type == "text"]
+        if text_blocks:
+            print(f"🤖  Claude: {' '.join(text_blocks)}\n")
 
-            result = issue_virtual_card(**block.input)
-            print("💳  PayWire issued a virtual card (mock):")
-            print(json.dumps(result, indent=2))
-            print()
+        if resp.stop_reason != "tool_use":
+            return
 
+        messages.append({"role": "assistant", "content": resp.content})
+
+        tool_results = []
+        for block in resp.content:
+            if block.type != "tool_use":
+                continue
+
+            print(f"🛠  {block.name}({json.dumps(block.input)})")
+
+            if block.name == "issue_virtual_card":
+                result = issue_virtual_card(**block.input)
+                print(f"💳  PayWire issued: {json.dumps(result, indent=2)}\n")
+            elif block.name == "attempt_purchase":
+                result = attempt_purchase(**block.input)
+                if result["approved"]:
+                    print(f"✅  PayWire APPROVED: {json.dumps(result, indent=2)}\n")
+                else:
+                    print(f"❌  PayWire DECLINED: {result['reason']}\n")
+            else:
+                result = {"error": f"unknown tool {block.name}"}
+
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result),
+                }
+            )
+
+        messages.append({"role": "user", "content": tool_results})
+
+
+# --- Three demo runs ------------------------------------------------------
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print(" Test 1: in-budget + allowed merchant → APPROVE")
+    print("=" * 60)
     run_agent(
-        "I need you to buy me a USB-C cable for my robotics project. "
-        "Budget is $20 max."
+        "Issue me a virtual card with a $20 cap, only usable at amazon.com. "
+        "Then use it to buy a USB-C cable from amazon.com for $15."
+    )
+
+    print("=" * 60)
+    print(" Test 2: over-budget → DECLINE")
+    print("=" * 60)
+    run_agent(
+        "Issue me a virtual card with a $20 cap, usable at amazon.com. "
+        "Then attempt to buy a $99 keyboard from amazon.com."
+    )
+
+    print("=" * 60)
+    print(" Test 3: wrong merchant → DECLINE")
+    print("=" * 60)
+    run_agent(
+        "Issue me a $50 card limited to amazon.com only. "
+        "Then attempt a $10 purchase from ebay.com."
     )
