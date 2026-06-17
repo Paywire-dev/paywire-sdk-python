@@ -3,3 +3,4 @@ stripe>=8.0.0
 python-dotenv>=1.0.0
 fastapi
 uvicorn
+pyjwt
